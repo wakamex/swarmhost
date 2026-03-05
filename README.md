@@ -90,6 +90,7 @@ python swarm.py <goal> [flags]
 | `--local` | false | Skip GitHub PRs; commit locally, merge onto base branch |
 | `--no-planner` | false | Disable automatic planner refills (use with `--epic`) |
 | `--design-doc` | — | Parse dependency graph from a design doc |
+| `--conventions` | — | File with conventions injected into every worker prompt |
 | `--dry-run` | false | Run planner, show tasks and deps, exit |
 | `--git-name` | Swarm | Git author name for worker commits |
 | `--git-email` | swarm@localhost | Git author email for worker commits |

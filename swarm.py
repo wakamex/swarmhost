@@ -830,7 +830,11 @@ async def run_conflict_worker(
 
 # ── Worker ───────────────────────────────────────────────────────────────────
 
-def build_worker_prompt(task: Task, slot: int, *, git_name: str, git_email: str, base_branch: str, local: bool = False) -> str:
+def build_worker_prompt(
+    task: Task, slot: int, *,
+    git_name: str, git_email: str, base_branch: str, local: bool = False,
+    conventions: str = "", recent_tasks: list[str] | None = None,
+) -> str:
     if local:
         finish_steps = f"""\
 5. Close the beads task with the branch name:
@@ -846,6 +850,22 @@ def build_worker_prompt(task: Task, slot: int, *, git_name: str, git_email: str,
 7. Close the beads task with the PR URL:
    bd close {task.id} --reason "PR: <paste the PR URL here>\""""
 
+    # Build optional context sections
+    extra_sections = ""
+    if conventions:
+        extra_sections += f"""
+## Conventions (MUST follow)
+
+{conventions}
+"""
+    if recent_tasks:
+        recent_list = "\n".join(f"  - {t}" for t in recent_tasks)
+        extra_sections += f"""
+## Recently completed by other workers (reuse existing code, don't reimplement)
+
+{recent_list}
+"""
+
     return f"""\
 You are worker-{slot} in a swarm of AI coding agents. You have been assigned
 a single task to implement.
@@ -857,7 +877,7 @@ Title: {task.title}
 
 Description:
 {task.description}
-
+{extra_sections}
 ## Instructions
 
 1. First, claim the task:
@@ -865,10 +885,14 @@ Description:
 
 2. Implement ONLY the change described above — nothing more.
    - Read relevant files first, understand the code.
+   - Check what other workers have already built before writing new code.
    - Make the minimal, focused changes needed.
    - Follow existing code style and conventions.
    - Do NOT work on anything outside your assigned task.
    - Other modules are being handled by other workers.
+   - If the task requires resources you don't have (GPU, cloud services, etc.),
+     write the script/config but do NOT generate fake or placeholder results.
+     Close the task with: bd close {task.id} --reason "NEEDS_HUMAN: <what's needed>"
 
 3. Run the project's test suite. Fix any failures your changes introduced.
 
@@ -896,6 +920,8 @@ async def run_worker(
     git_email: str,
     base_branch: str,
     local: bool = False,
+    conventions: str = "",
+    recent_tasks: list[str] | None = None,
 ) -> None:
     """Run a single worker in its worktree."""
     worker.task = task
@@ -979,7 +1005,11 @@ async def run_worker(
         "git", "config", "user.email", git_email,
         cwd=worktree_dir, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
 
-    prompt = build_worker_prompt(task, worker.slot, git_name=git_name, git_email=git_email, base_branch=base_branch, local=local)
+    prompt = build_worker_prompt(
+        task, worker.slot, git_name=git_name, git_email=git_email,
+        base_branch=base_branch, local=local,
+        conventions=conventions, recent_tasks=recent_tasks,
+    )
     cmd = [
         "claude", "-p",
         "--output-format", "stream-json", "--verbose",
@@ -1070,7 +1100,18 @@ async def run_worker(
                 task_status = "closed"
                 event(state, f"worker-{worker.slot} had {commit_count} commits, auto-closed bead")
 
-        if task_status == "closed":
+        # Check if worker flagged this as needing human intervention
+        close_reason = ""
+        if task_status == "closed" and isinstance(task_data, dict):
+            close_reason = task_data.get("close_reason", "") or ""
+
+        if task_status == "closed" and "NEEDS_HUMAN" in close_reason:
+            worker.result = "success"
+            state.completed += 1
+            state.history.append(CompletedTask(
+                task.id, task.title, worker.slot, dur, "success"))
+            event(state, f"worker-{worker.slot} ⚠ {task.id} NEEDS_HUMAN ({fmt_duration_short(dur)})")
+        elif task_status == "closed":
             worker.result = "success"
             worker.pr_url = ref
             state.completed += 1
@@ -1299,6 +1340,8 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
     planner_task: asyncio.Task | None = None
     worker_tasks: dict[int, asyncio.Task] = {}  # slot -> asyncio.Task
     pending_conflicts: list[str] = []  # refs needing conflict resolution
+    conventions_text = args.conventions.read_text().strip() if args.conventions else ""
+    recent_titles: list[str] = []  # titles of recently completed tasks
 
     # Start the display refresh loop
     display_task = asyncio.create_task(display_loop(state))
@@ -1512,6 +1555,8 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                         git_email=args.git_email,
                         base_branch=args.base_branch,
                         local=args.local,
+                        conventions=conventions_text,
+                        recent_tasks=recent_titles,
                     )
                 )
 
@@ -1571,6 +1616,9 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                                         pending_conflicts.append(ref)
                                 await cleanup_worktree(state, w)
                             elif w.result == "success":
+                                # Track for recently-merged context
+                                if w.task:
+                                    recent_titles.append(w.task.title)
                                 # Regular worker — auto-merge
                                 merge_ref = w.branch if args.local else w.pr_url
                                 if merge_ref:
@@ -1748,6 +1796,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--design-doc", type=Path, default=None,
         help="Parse dependency edges from a design doc (looks for 'depends on: PR N' patterns)",
+    )
+    parser.add_argument(
+        "--conventions", type=Path, default=None,
+        help="File with conventions to inject into every worker prompt",
     )
     parser.add_argument(
         "--git-name", default="Swarm",
