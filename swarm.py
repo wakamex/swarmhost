@@ -17,6 +17,8 @@ import argparse
 import asyncio
 import datetime
 import json
+import os
+import re
 import shutil
 import signal
 import sys
@@ -31,6 +33,9 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
 NY_TZ = ZoneInfo("America/New_York")
+
+# Clean env for spawning claude subprocesses (avoid nested session detection)
+_CLAUDE_ENV = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
 
 
 # ── ANSI ─────────────────────────────────────────────────────────────────────
@@ -87,6 +92,7 @@ class WorkerState:
     start_time: float = 0.0
     result: str = "idle"  # idle, running, success, failed, timeout
     pr_url: str = ""
+    last_line: str = ""
 
 
 @dataclass
@@ -103,6 +109,10 @@ class SwarmState:
     planner_start_time: float = 0.0
     planner_process: asyncio.subprocess.Process | None = None
     planner_runs: int = 0
+    merger_running: bool = False
+    merger_start_time: float = 0.0
+    merger_process: asyncio.subprocess.Process | None = None
+    merger_runs: int = 0
     start_time: float = field(default_factory=time.monotonic)
     shutdown: bool = False      # first Ctrl-C: drain
     force_quit: bool = False    # second Ctrl-C: kill now
@@ -110,6 +120,87 @@ class SwarmState:
     events: deque = field(default_factory=lambda: deque(maxlen=8))
     tick: int = 0  # animation frame counter
     last_children: list[dict] = field(default_factory=list)
+    planner_last_line: str = ""
+    merger_last_line: str = ""
+
+
+# ── Stream helper ────────────────────────────────────────────────────────────
+
+def _extract_status(data: dict) -> str | None:
+    """Extract a human-readable status snippet from a stream-json event."""
+    etype = data.get("type", "")
+
+    if etype == "assistant":
+        msg = data.get("message", {})
+        content = msg.get("content", [])
+        for block in content:
+            btype = block.get("type", "")
+            if btype == "tool_use":
+                name = block.get("name", "")
+                inp = block.get("input", {})
+                if name == "Bash":
+                    cmd = inp.get("command", "")
+                    return f"$ {cmd[:70]}" if cmd else f"[{name}]"
+                elif name in ("Read", "Write", "Edit"):
+                    path = inp.get("file_path", "")
+                    short = path.split("/")[-1] if "/" in path else path
+                    return f"{name}: {short}" if short else f"[{name}]"
+                elif name in ("Glob", "Grep"):
+                    pat = inp.get("pattern", "")
+                    return f"{name}: {pat[:50]}" if pat else f"[{name}]"
+                else:
+                    return f"[{name}]"
+            elif btype == "text":
+                text = block.get("text", "").strip()
+                if text:
+                    # Take last non-empty line
+                    last = text.rstrip().rsplit("\n", 1)[-1].strip()
+                    return last if last else None
+            elif btype == "thinking":
+                return "thinking..."
+    elif etype == "result":
+        return None
+    return None
+
+
+async def stream_output(
+    proc: asyncio.subprocess.Process,
+    prompt_bytes: bytes,
+    on_line: callable,
+) -> str:
+    """Feed stdin, stream stdout as JSON events, call on_line with status snippets, return final result text."""
+    assert proc.stdin is not None
+    proc.stdin.write(prompt_bytes)
+    await proc.stdin.drain()
+    proc.stdin.close()
+
+    result_text = ""
+    assert proc.stdout is not None
+    while True:
+        line = await proc.stdout.readline()
+        if not line:
+            break
+        text = line.decode(errors="replace").rstrip()
+        if not text:
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            # Not JSON — show raw text
+            if text.strip():
+                on_line(text.strip())
+            continue
+
+        status = _extract_status(data)
+        if status:
+            on_line(status)
+
+        # Capture final result text
+        if data.get("type") == "result":
+            result_text = data.get("result", "")
+
+    await proc.wait()
+    return result_text
 
 
 # ── bd helpers ───────────────────────────────────────────────────────────────
@@ -254,6 +345,8 @@ def render_status(state: SwarmState) -> str:
                 f"  {w.task.id}  {title}"
                 f"  {C.DIM}{wt}{C.RESET}"
             )
+            if w.last_line:
+                lines.append(f"    {C.DIM}{truncate(w.last_line, 72)}{C.RESET}")
         elif w.result == "success" and w.task:
             pr = f"  {C.CYAN}{w.pr_url}{C.RESET}" if w.pr_url else ""
             title = truncate(w.task.title, 45)
@@ -272,14 +365,25 @@ def render_status(state: SwarmState) -> str:
         else:
             lines.append(f"  {C.DIM}· worker-{w.slot}  idle{C.RESET}")
 
-    # Planner
+    # Planner & Merger
     lines.append("")
     if state.planner_running:
         pframe = PLANNER_FRAMES[tick % len(PLANNER_FRAMES)]
         pt = fmt_elapsed(now - state.planner_start_time)
         lines.append(f"  {pframe} {C.MAGENTA}planner{C.RESET}  thinking...  {C.DIM}{pt}{C.RESET}")
+        if state.planner_last_line:
+            lines.append(f"    {C.DIM}{truncate(state.planner_last_line, 72)}{C.RESET}")
     else:
         lines.append(f"  {C.DIM}  planner  idle  ({state.planner_runs} runs){C.RESET}")
+
+    if state.merger_running:
+        spin = SPINNER[tick % len(SPINNER)]
+        mt = fmt_elapsed(now - state.merger_start_time)
+        lines.append(f"  {C.BLUE}{spin}{C.RESET} {C.BLUE}merger{C.RESET}   reviewing  {C.DIM}{mt}{C.RESET}")
+        if state.merger_last_line:
+            lines.append(f"    {C.DIM}{truncate(state.merger_last_line, 72)}{C.RESET}")
+    elif state.merger_runs > 0:
+        lines.append(f"  {C.DIM}  merger   idle  ({state.merger_runs} runs){C.RESET}")
 
     # Event log
     if state.events:
@@ -363,6 +467,7 @@ async def run_planner(
 
     cmd = [
         "claude", "-p",
+        "--output-format", "stream-json", "--verbose",
         "--model", model,
         "--allowedTools", "Bash Read Glob Grep",
         "--dangerously-skip-permissions",
@@ -373,6 +478,7 @@ async def run_planner(
     state.planner_running = True
     state.planner_start_time = time.monotonic()
     state.planner_runs += 1
+    state.planner_last_line = ""
     event(state, f"planner run #{state.planner_runs} started")
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -381,10 +487,15 @@ async def run_planner(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=state.repo,
+            env=_CLAUDE_ENV,
+            limit=10 * 1024 * 1024,  # 10MB line buffer for stream-json
         )
         state.planner_process = proc
-        stdout, stderr = await proc.communicate(input=prompt.encode())
-        output = stdout.decode()
+
+        def _on_line(text: str) -> None:
+            state.planner_last_line = text
+
+        output = await stream_output(proc, prompt.encode(), _on_line)
         dur = time.monotonic() - state.planner_start_time
 
         if "SWARM_GOAL_COMPLETE" in output:
@@ -392,8 +503,6 @@ async def run_planner(
             return True
         if proc.returncode != 0:
             event(state, f"planner exited with code {proc.returncode} ({fmt_elapsed(dur)})")
-            if stderr:
-                log(f"planner stderr: {stderr.decode()[:500]}")
         else:
             event(state, f"planner finished ({fmt_elapsed(dur)})")
         return False
@@ -404,9 +513,65 @@ async def run_planner(
 
 # ── Merger ───────────────────────────────────────────────────────────────
 
-def build_merger_prompt(goal: str, epic_id: str, pr_urls: list[str]) -> str:
-    pr_list = "\n".join(f"  - {url}" for url in pr_urls)
-    return f"""\
+def build_merger_prompt(goal: str, epic_id: str, refs: list[str], base_branch: str, *, local: bool = False) -> str:
+    ref_list = "\n".join(f"  - {r}" for r in refs)
+
+    if local:
+        return f"""\
+You are a merger agent for a swarm of AI coding agents. Workers have completed
+tasks and committed to local branches. Your job is to review and merge them
+into the base branch so that dependent tasks can proceed.
+
+## High-level goal
+
+{goal}
+
+## Base branch
+
+`{base_branch}`
+
+## Branches to review and merge
+
+{ref_list}
+
+## Instructions
+
+For each branch above:
+
+1. Review the diff against base:
+   git log {base_branch}..<branch> --oneline
+   git diff {base_branch}...<branch>
+
+2. Check that it looks reasonable:
+   - Code follows existing patterns and conventions
+   - No obvious bugs, security issues, or broken imports
+   - The change is focused and matches a single task
+   - No unrelated changes snuck in
+
+3. Run the test suite to verify nothing is broken:
+   git checkout {base_branch}
+   git merge <branch> --no-edit
+   Then run the project's test suite (check package.json / Makefile / pyproject.toml).
+
+4. If the merge + tests pass, you're done with this branch. Move to the next.
+
+5. If the branch has issues:
+   - Undo the merge: git reset --hard HEAD~1
+   - Find the beads task ID by checking:
+     bd list --parent {epic_id} --all --json
+     (look for the closed task whose close_reason mentions this branch)
+   - Reopen it with feedback:
+     bd reopen <id>
+     bd update <id> --append-notes "Merger feedback: <what needs fixing>"
+
+Process them in dependency order — if branch A's code is needed by branch B,
+merge A first.
+
+Review the current task state to understand dependencies:
+  bd list --parent {epic_id} --all --json
+"""
+    else:
+        return f"""\
 You are a merger agent for a swarm of AI coding agents. Workers have completed
 tasks and created PRs. Your job is to review and merge them so that dependent
 tasks can proceed.
@@ -415,9 +580,13 @@ tasks can proceed.
 
 {goal}
 
+## Base branch
+
+All PRs target: `{base_branch}`
+
 ## PRs to review and merge
 
-{pr_list}
+{ref_list}
 
 ## Instructions
 
@@ -446,8 +615,8 @@ For each PR above:
    bd reopen <id>
    bd update <id> --append-notes "Merger feedback: <what needs fixing>"
 
-6. After merging all good PRs, update main:
-   git pull origin main
+6. After merging all good PRs, update the base branch:
+   git pull origin {base_branch}
 
 Process them in dependency order — if PR A's code is needed by PR B,
 merge A first.
@@ -459,7 +628,7 @@ Review the current task state to understand dependencies:
 
 async def get_blocked_tasks(epic_id: str, cwd: Path | None = None) -> list[dict]:
     """Get tasks that are blocked (have unresolved dependencies)."""
-    data = await bd_json("blocked", "--json", cwd=cwd)
+    data = await bd_json("blocked", cwd=cwd)
     if isinstance(data, dict):
         data = data.get("issues", data.get("items", []))
     if not isinstance(data, list):
@@ -470,69 +639,76 @@ async def get_blocked_tasks(epic_id: str, cwd: Path | None = None) -> list[dict]
     return [t for t in data if t.get("id") in child_ids]
 
 
-async def get_mergeable_prs(epic_id: str, cwd: Path | None = None) -> list[str]:
-    """Find PR URLs from closed beads whose dependents are still blocked.
+async def get_mergeable_refs(epic_id: str, *, local: bool = False, cwd: Path | None = None) -> list[str]:
+    """Find PR URLs or branch names from closed beads whose dependents are still blocked.
+
+    Returns PR URLs (in PR mode) or branch names (in local mode).
 
     A bead is "mergeable" if:
-    - It's closed (worker finished, PR created)
-    - Its close_reason contains a PR URL
+    - It's closed (worker finished)
+    - Its close_reason contains a PR URL or branch name
     - It has dependents that are still open/blocked
     """
     children = await get_all_children(epic_id, cwd=cwd)
 
     # Build maps
-    closed_with_pr: dict[str, str] = {}  # bead_id -> pr_url
+    closed_with_ref: dict[str, str] = {}  # bead_id -> pr_url or branch
     open_ids = set()
     for c in children:
         cid = c.get("id", "")
         status = c.get("status", "")
         reason = c.get("close_reason", "") or ""
-        if status == "closed" and "github.com" in reason and "/pull/" in reason:
-            # Extract URL from reason
-            for word in reason.split():
-                if "github.com" in word and "/pull/" in word:
-                    closed_with_pr[cid] = word.strip()
-                    break
+        if status == "closed" and reason:
+            if local and "branch:" in reason:
+                # Extract branch name
+                branch = reason.split("branch:", 1)[1].strip()
+                if branch:
+                    closed_with_ref[cid] = branch
+            elif not local and "github.com" in reason and "/pull/" in reason:
+                for word in reason.split():
+                    if "github.com" in word and "/pull/" in word:
+                        closed_with_ref[cid] = word.strip()
+                        break
         elif status in ("open", "in_progress", "blocked"):
             open_ids.add(cid)
 
-    if not closed_with_pr or not open_ids:
+    if not closed_with_ref or not open_ids:
         return []
 
     # Check which closed beads have open dependents
-    # Use bd dep list to find dependencies
     mergeable = []
-    for bead_id, pr_url in closed_with_pr.items():
+    for bead_id, ref in closed_with_ref.items():
         try:
             dep_data = await bd_json("dep", "list", bead_id, cwd=cwd)
             if isinstance(dep_data, dict):
-                # Check if this bead blocks any open tasks
                 blocks = dep_data.get("blocks", [])
                 if isinstance(blocks, list):
                     for blocked in blocks:
                         blocked_id = blocked.get("id", blocked) if isinstance(blocked, dict) else str(blocked)
                         if blocked_id in open_ids:
-                            mergeable.append(pr_url)
+                            mergeable.append(ref)
                             break
         except Exception:
-            # If we can't check deps, include it anyway — merger will sort it out
-            mergeable.append(pr_url)
+            mergeable.append(ref)
 
     return mergeable
 
 
 async def run_merger(
     state: SwarmState,
-    pr_urls: list[str],
+    refs: list[str],
     *,
     model: str,
     budget: float,
+    base_branch: str,
+    local: bool = False,
 ) -> None:
-    """Spawn a merger Claude session to review and merge PRs."""
-    prompt = build_merger_prompt(state.goal, state.epic_id, pr_urls)
+    """Spawn a merger Claude session to review and merge PRs or local branches."""
+    prompt = build_merger_prompt(state.goal, state.epic_id, refs, base_branch, local=local)
 
     cmd = [
         "claude", "-p",
+        "--output-format", "stream-json", "--verbose",
         "--model", model,
         "--allowedTools", "Bash Read Glob Grep",
         "--dangerously-skip-permissions",
@@ -543,7 +719,8 @@ async def run_merger(
     state.merger_running = True
     state.merger_start_time = time.monotonic()
     state.merger_runs += 1
-    event(state, f"merger reviewing {len(pr_urls)} PRs")
+    state.merger_last_line = ""
+    event(state, f"merger reviewing {len(refs)} refs")
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -551,26 +728,32 @@ async def run_merger(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=state.repo,
+            env=_CLAUDE_ENV,
+            limit=10 * 1024 * 1024,
         )
         state.merger_process = proc
-        stdout, stderr = await proc.communicate(input=prompt.encode())
+
+        def _on_line(text: str) -> None:
+            state.merger_last_line = text
+
+        output = await stream_output(proc, prompt.encode(), _on_line)
         dur = time.monotonic() - state.merger_start_time
 
         if proc.returncode != 0:
             event(state, f"merger exited with code {proc.returncode} ({fmt_elapsed(dur)})")
-            if stderr:
-                log(f"merger stderr: {stderr.decode()[:500]}")
         else:
             event(state, f"merger finished ({fmt_elapsed(dur)})")
 
-        # Pull main to pick up merged changes
-        pull = await asyncio.create_subprocess_exec(
-            "git", "pull", "origin", "main",
-            cwd=state.repo,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await pull.communicate()
+        # In PR mode, pull to pick up remote merges; in local mode merger
+        # already merged locally so just ensure we're on the base branch
+        if not local:
+            pull = await asyncio.create_subprocess_exec(
+                "git", "pull", "origin", base_branch,
+                cwd=state.repo,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await pull.communicate()
 
     finally:
         state.merger_running = False
@@ -579,7 +762,22 @@ async def run_merger(
 
 # ── Worker ───────────────────────────────────────────────────────────────────
 
-def build_worker_prompt(task: Task, slot: int, *, git_name: str, git_email: str) -> str:
+def build_worker_prompt(task: Task, slot: int, *, git_name: str, git_email: str, base_branch: str, local: bool = False) -> str:
+    if local:
+        finish_steps = f"""\
+5. Close the beads task with the branch name:
+   bd close {task.id} --reason "branch: $(git rev-parse --abbrev-ref HEAD)\""""
+    else:
+        finish_steps = f"""\
+5. Push your branch:
+   git push -u origin HEAD
+
+6. Create a PR targeting the base branch:
+   gh pr create --base {base_branch} --title "{task.title}" --body "Implements {task.id}: {task.title}"
+
+7. Close the beads task with the PR URL:
+   bd close {task.id} --reason "PR: <paste the PR URL here>\""""
+
     return f"""\
 You are worker-{slot} in a swarm of AI coding agents. You have been assigned
 a single task to implement.
@@ -610,14 +808,7 @@ Description:
    git add -A
    git -c user.name="{git_name}-{slot}" -c user.email="{git_email}" commit -m "<descriptive message>"
 
-5. Push your branch:
-   git push -u origin HEAD
-
-6. Create a PR:
-   gh pr create --title "{task.title}" --body "Implements {task.id}: {task.title}"
-
-7. Close the beads task with the PR URL:
-   bd close {task.id} --reason "PR: <paste the PR URL here>"
+{finish_steps}
 
 If anything fails and you cannot complete the task, release it:
    bd update {task.id} --status open --assignee ""
@@ -635,6 +826,8 @@ async def run_worker(
     timeout: int,
     git_name: str,
     git_email: str,
+    base_branch: str,
+    local: bool = False,
 ) -> None:
     """Run a single worker in its worktree."""
     worker.task = task
@@ -642,7 +835,7 @@ async def run_worker(
     worker.pr_url = ""
     worker.start_time = time.monotonic()
 
-    ts = int(time.time())
+    ts = f"{int(time.time())}-{int(time.monotonic() * 1000) % 10000}"
     branch = f"swarm/worker-{worker.slot}-{ts}"
     worktree_dir = state.repo / ".swarm" / "worktrees" / f"worker-{worker.slot}"
     worker.branch = branch
@@ -653,14 +846,24 @@ async def run_worker(
     # Clean up stale worktree at this path if it exists
     if worktree_dir.exists():
         try:
-            await asyncio.create_subprocess_exec(
+            p = await asyncio.create_subprocess_exec(
                 "git", "worktree", "remove", "--force", str(worktree_dir),
                 cwd=state.repo,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
+            await p.communicate()
         except Exception:
             pass
+
+    # Delete stale branch if it exists
+    p = await asyncio.create_subprocess_exec(
+        "git", "branch", "-D", branch,
+        cwd=state.repo,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await p.communicate()
 
     # Create worktree
     proc = await asyncio.create_subprocess_exec(
@@ -689,9 +892,10 @@ async def run_worker(
         "git", "config", "user.email", git_email,
         cwd=worktree_dir, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
 
-    prompt = build_worker_prompt(task, worker.slot, git_name=git_name, git_email=git_email)
+    prompt = build_worker_prompt(task, worker.slot, git_name=git_name, git_email=git_email, base_branch=base_branch, local=local)
     cmd = [
         "claude", "-p",
+        "--output-format", "stream-json", "--verbose",
         "--model", model,
         "--allowedTools", "Bash Read Write Edit Glob Grep",
         "--dangerously-skip-permissions",
@@ -706,14 +910,20 @@ async def run_worker(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=worktree_dir,
+            env=_CLAUDE_ENV,
+            limit=10 * 1024 * 1024,
         )
         worker.process = worker_proc
 
         prompt_bytes = prompt.encode()
+
+        def _on_line(text: str) -> None:
+            worker.last_line = text
+
         if timeout > 0:
             try:
-                stdout_data, stderr_out = await asyncio.wait_for(
-                    worker_proc.communicate(input=prompt_bytes),
+                output = await asyncio.wait_for(
+                    stream_output(worker_proc, prompt_bytes, _on_line),
                     timeout=timeout * 60,
                 )
             except asyncio.TimeoutError:
@@ -729,38 +939,58 @@ async def run_worker(
                          cwd=state.repo, check=False)
                 return
         else:
-            stdout_data, stderr_out = await worker_proc.communicate(input=prompt_bytes)
+            output = await stream_output(worker_proc, prompt_bytes, _on_line)
 
         dur = time.monotonic() - worker.start_time
-        output = stdout_data.decode()
 
         # Check if the task was closed in beads
         try:
             task_data = await bd_json("show", task.id, cwd=state.repo)
+            if isinstance(task_data, list) and task_data:
+                task_data = task_data[0]
             task_status = task_data.get("status", "") if isinstance(task_data, dict) else ""
         except Exception:
             task_status = ""
 
-        # Extract PR URL from output
-        pr_url = ""
-        for line in output.splitlines():
-            if "github.com" in line and "/pull/" in line:
-                # Pull out just the URL
-                for word in line.split():
-                    if "github.com" in word and "/pull/" in word:
-                        pr_url = word.strip()
+        # Extract PR URL or branch from output/close_reason
+        ref = ""
+        if local:
+            ref = branch  # we know the branch name
+        else:
+            for line in output.splitlines():
+                if "github.com" in line and "/pull/" in line:
+                    for word in line.split():
+                        if "github.com" in word and "/pull/" in word:
+                            ref = word.strip()
+                            break
+                    if ref:
                         break
-                if pr_url:
-                    break
+
+        # If worker didn't close the bead, check if it made commits
+        if task_status != "closed" and worktree_dir.exists():
+            check_commits = await asyncio.create_subprocess_exec(
+                "git", "rev-list", "--count", f"{base_branch}..HEAD",
+                cwd=worktree_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            count_out, _ = await check_commits.communicate()
+            commit_count = int(count_out.decode().strip() or "0")
+            if commit_count > 0:
+                reason = f"branch: {branch}" if local else f"auto-closed by orchestrator"
+                await bd("close", task.id, "--reason", reason,
+                         cwd=state.repo, check=False)
+                task_status = "closed"
+                event(state, f"worker-{worker.slot} had {commit_count} commits, auto-closed bead")
 
         if task_status == "closed":
             worker.result = "success"
-            worker.pr_url = pr_url
+            worker.pr_url = ref
             state.completed += 1
             state.history.append(CompletedTask(
-                task.id, task.title, worker.slot, dur, "success", pr_url))
-            pr_note = f"  PR: {pr_url}" if pr_url else ""
-            event(state, f"worker-{worker.slot} ✓ {task.id} ({fmt_duration_short(dur)}){pr_note}")
+                task.id, task.title, worker.slot, dur, "success", ref))
+            ref_note = f"  {ref}" if ref else ""
+            event(state, f"worker-{worker.slot} ✓ {task.id} ({fmt_duration_short(dur)}){ref_note}")
         else:
             worker.result = "failed"
             state.failed += 1
@@ -818,9 +1048,12 @@ def log(msg: str) -> None:
 
 # ── Bootstrap ────────────────────────────────────────────────────────────────
 
-async def verify_tools() -> None:
-    """Check that bd and claude are in PATH."""
-    for tool in ("bd", "claude", "git", "gh"):
+async def verify_tools(*, local: bool = False) -> None:
+    """Check that required tools are in PATH."""
+    required = ["bd", "claude", "git"]
+    if not local:
+        required.append("gh")
+    for tool in required:
         if not shutil.which(tool):
             print(f"Error: '{tool}' not found in PATH", file=sys.stderr)
             sys.exit(1)
@@ -847,6 +1080,72 @@ async def create_epic(goal: str, repo: Path) -> str:
     return epic_id
 
 
+# ── Design doc dependency parsing ────────────────────────────────────────────
+
+def parse_design_deps(doc_path: Path) -> dict[int, list[int]]:
+    """Parse dependency edges from a design doc.
+
+    Looks for lines like:
+      **PR 6 — Strategy evaluator loop** (depends on: PR 2, 3, 4)
+    Returns {6: [2, 3, 4], ...}
+    """
+    text = doc_path.read_text()
+    deps: dict[int, list[int]] = {}
+    for m in re.finditer(
+        r"\*\*PR\s+(\d+)\b.*?\(depends on:\s*(.+?)\)",
+        text,
+    ):
+        pr_num = int(m.group(1))
+        dep_str = m.group(2)
+        blockers: list[int] = []
+        for d in re.findall(r"(?:PR\s*)?(\d+)", dep_str):
+            blockers.append(int(d))
+        if blockers:
+            deps[pr_num] = blockers
+    return deps
+
+
+async def apply_design_deps(
+    epic_id: str,
+    doc_path: Path,
+    *,
+    cwd: Path | None = None,
+) -> int:
+    """Parse deps from design doc and apply them to beads tasks.
+
+    Maps "PR N" to bead IDs by matching task titles containing "PR N".
+    Returns number of edges added.
+    """
+    deps = parse_design_deps(doc_path)
+    if not deps:
+        return 0
+
+    # Build PR number -> bead ID mapping from task titles
+    children = await get_all_children(epic_id, cwd=cwd)
+    pr_to_bead: dict[int, str] = {}
+    for c in children:
+        title = c.get("title", "")
+        m = re.match(r"PR\s+(\d+)\b", title)
+        if m:
+            pr_to_bead[int(m.group(1))] = c.get("id", "")
+
+    added = 0
+    for pr_num, blockers in deps.items():
+        blocked_id = pr_to_bead.get(pr_num)
+        if not blocked_id:
+            continue
+        for blocker_num in blockers:
+            blocker_id = pr_to_bead.get(blocker_num)
+            if not blocker_id:
+                continue
+            try:
+                await bd("dep", "add", blocked_id, blocker_id, cwd=cwd)
+                added += 1
+            except Exception:
+                pass  # already exists or other error
+    return added
+
+
 # ── Display refresh loop ────────────────────────────────────────────────────
 
 async def display_loop(state: SwarmState) -> None:
@@ -869,33 +1168,86 @@ async def display_loop(state: SwarmState) -> None:
 async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
     refill_threshold = args.refill if args.refill > 0 else state.concurrency
     planner_task: asyncio.Task | None = None
+    merger_task: asyncio.Task | None = None
     worker_tasks: dict[int, asyncio.Task] = {}  # slot -> asyncio.Task
 
     # Start the display refresh loop
     display_task = asyncio.create_task(display_loop(state))
 
-    # Initial planner run — must finish before workers start
-    event(state, "running initial planner to create first batch...")
-    goal_complete = await run_planner(
-        state,
-        model=args.planner_model,
-        budget=args.budget * 3,
-    )
-    if goal_complete:
-        event(state, "planner says goal is already complete")
-        state.shutdown = True
-        display_task.cancel()
-        return
+    if args.epic:
+        # Resuming — skip planner, check existing tasks
+        ready = await get_ready_tasks(state.epic_id, cwd=state.repo)
+        all_children = await get_all_children(state.epic_id, cwd=state.repo)
+        if not ready and not all_children:
+            event(state, f"epic {args.epic} has no tasks — exiting")
+            state.shutdown = True
+            display_task.cancel()
+            return
+        event(state, f"resuming epic {args.epic}: {len(ready)} ready, {len(all_children)} total")
+    else:
+        # Initial planner run — must finish before workers start
+        event(state, "running initial planner to create first batch...")
+        goal_complete = await run_planner(
+            state,
+            model=args.planner_model,
+            budget=args.budget * 3,
+        )
+        if goal_complete:
+            event(state, "planner says goal is already complete")
+            state.shutdown = True
+            display_task.cancel()
+            return
 
-    ready = await get_ready_tasks(state.epic_id, cwd=state.repo)
-    if not ready:
-        event(state, "planner created no tasks — exiting")
-        state.shutdown = True
-        display_task.cancel()
-        return
+        ready = await get_ready_tasks(state.epic_id, cwd=state.repo)
+        if not ready:
+            event(state, "planner created no tasks — exiting")
+            state.shutdown = True
+            display_task.cancel()
+            return
 
-    event(state, f"initial batch ready: {len(ready)} tasks")
+        event(state, f"initial batch ready: {len(ready)} tasks")
     state.last_children = await get_all_children(state.epic_id, cwd=state.repo)
+
+    # Apply deps from design doc if provided
+    if args.design_doc:
+        n = await apply_design_deps(
+            state.epic_id, args.design_doc, cwd=state.repo)
+        if n > 0:
+            event(state, f"applied {n} dependency edges from {args.design_doc.name}")
+            # Refresh ready tasks since deps may have changed what's unblocked
+            ready = await get_ready_tasks(state.epic_id, cwd=state.repo)
+            state.last_children = await get_all_children(state.epic_id, cwd=state.repo)
+        else:
+            event(state, f"no new deps found in {args.design_doc.name}")
+
+    if args.dry_run:
+        display_task.cancel()
+        children = state.last_children
+        sys.stderr.write(f"\n  {C.BOLD}Dry run — planner created {len(children)} tasks:{C.RESET}\n\n")
+        for c in children:
+            cid = c.get("id", "")
+            title = c.get("title", "")
+            status = c.get("status", "open")
+            sys.stderr.write(f"  {cid}  {status:<12} {title}\n")
+        # Show dependency info
+        sys.stderr.write(f"\n  {C.BOLD}Dependencies:{C.RESET}\n\n")
+        for c in children:
+            cid = c.get("id", "")
+            try:
+                dep_data = await bd_json("dep", "list", cid, cwd=state.repo)
+                if isinstance(dep_data, dict):
+                    blocked_by = dep_data.get("blocked_by", dep_data.get("blockedBy", []))
+                    if blocked_by:
+                        blockers = ", ".join(
+                            b.get("id", str(b)) if isinstance(b, dict) else str(b)
+                            for b in blocked_by
+                        )
+                        sys.stderr.write(f"  {cid}  blocked by: {blockers}\n")
+            except Exception:
+                pass
+        sys.stderr.write(f"\n  {C.DIM}epic: {state.epic_id}{C.RESET}\n")
+        sys.stderr.write(f"  {C.DIM}Re-run without --dry-run to start workers.{C.RESET}\n\n")
+        return
 
     try:
         while not state.shutdown:
@@ -914,7 +1266,8 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
             ready_count = len(ready)
 
             # Trigger planner if queue is low
-            if (ready_count < refill_threshold
+            if (not args.no_planner
+                    and ready_count < refill_threshold
                     and not state.planner_running
                     and (planner_task is None or planner_task.done())):
                 event(state, f"queue low ({ready_count}<{refill_threshold}), spawning planner")
@@ -943,9 +1296,46 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                         event(state, "planner finished but no new tasks — done")
                         break
                     continue
-                else:
-                    event(state, "no tasks, no workers, planner idle — done")
-                    break
+
+                # Check if merger can unblock progress
+                if not state.merger_running and (merger_task is None or merger_task.done()):
+                    try:
+                        mergeable = await get_mergeable_refs(
+                            state.epic_id, local=args.local, cwd=state.repo)
+                    except Exception as exc:
+                        log(f"Error checking mergeable refs: {exc}")
+                        mergeable = []
+
+                    if mergeable:
+                        label = "branches" if args.local else "PRs"
+                        event(state, f"blocked — spawning merger for {len(mergeable)} {label}")
+
+                        async def _run_merger(refs=mergeable):
+                            return await run_merger(
+                                state, refs,
+                                model=args.merger_model,
+                                budget=args.budget * 3,
+                                base_branch=args.base_branch,
+                                local=args.local,
+                            )
+
+                        merger_task = asyncio.create_task(_run_merger())
+                        # After spawning merger, loop back to re-check
+                        continue
+
+                # If merger is running, wait for it
+                if state.merger_running and merger_task and not merger_task.done():
+                    event(state, "no tasks — waiting for merger to unblock")
+                    await merger_task
+                    merger_task = None
+                    # Re-check ready tasks after merge
+                    ready = await get_ready_tasks(state.epic_id, cwd=state.repo)
+                    if ready:
+                        continue
+                    # Still stuck — fall through
+
+                event(state, "no tasks, no workers, planner idle — done")
+                break
 
             # Assign tasks to idle worker slots
             ready_idx = 0
@@ -972,6 +1362,8 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                         timeout=args.timeout,
                         git_name=args.git_name,
                         git_email=args.git_email,
+                        base_branch=args.base_branch,
+                        local=args.local,
                     )
                 )
 
@@ -982,6 +1374,8 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                     pending.add(t)
             if planner_task and not planner_task.done():
                 pending.add(planner_task)
+            if merger_task and not merger_task.done():
+                pending.add(merger_task)
 
             if not pending:
                 await asyncio.sleep(1)
@@ -998,10 +1392,15 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                             state.shutdown = True
                     except Exception as exc:
                         event(state, f"planner failed: {exc}")
-                        # Cooldown: don't retry immediately on failure
                         event(state, "planner cooldown 30s before retry")
                         await asyncio.sleep(30)
                     planner_task = None
+                elif merger_task and t is merger_task:
+                    try:
+                        t.result()
+                    except Exception as exc:
+                        event(state, f"merger failed: {exc}")
+                    merger_task = None
                 else:
                     for slot, wt in worker_tasks.items():
                         if wt is t:
@@ -1009,6 +1408,71 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                                 t.result()
                             except Exception as exc:
                                 event(state, f"worker-{slot} raised: {exc}")
+                            # Auto-merge completed worker's branch/PR
+                            w = state.workers[slot]
+                            if w.result == "success":
+                                if args.local and w.branch:
+                                    # Local mode: git merge branch
+                                    merge_proc = await asyncio.create_subprocess_exec(
+                                        "git", "merge", w.branch, "--no-edit",
+                                        cwd=state.repo,
+                                        stdout=asyncio.subprocess.PIPE,
+                                        stderr=asyncio.subprocess.PIPE,
+                                    )
+                                    m_out, m_err = await merge_proc.communicate()
+                                    if merge_proc.returncode == 0:
+                                        event(state, f"merged {w.branch} into {args.base_branch}")
+                                    else:
+                                        # Abort the failed merge, queue for merger agent
+                                        await asyncio.create_subprocess_exec(
+                                            "git", "merge", "--abort",
+                                            cwd=state.repo,
+                                            stdout=asyncio.subprocess.DEVNULL,
+                                            stderr=asyncio.subprocess.DEVNULL,
+                                        )
+                                        event(state, f"merge conflict on {w.branch} — queuing for merger agent")
+                                        if not state.merger_running and (merger_task is None or merger_task.done()):
+                                            async def _run_merger(refs=[w.branch]):
+                                                return await run_merger(
+                                                    state, refs,
+                                                    model=args.merger_model,
+                                                    budget=args.budget * 3,
+                                                    base_branch=args.base_branch,
+                                                    local=True,
+                                                )
+                                            merger_task = asyncio.create_task(_run_merger())
+                                elif not args.local and w.pr_url:
+                                    # PR mode: gh pr merge
+                                    merge_proc = await asyncio.create_subprocess_exec(
+                                        "gh", "pr", "merge", w.pr_url, "--merge",
+                                        cwd=state.repo,
+                                        stdout=asyncio.subprocess.PIPE,
+                                        stderr=asyncio.subprocess.PIPE,
+                                    )
+                                    m_out, m_err = await merge_proc.communicate()
+                                    if merge_proc.returncode == 0:
+                                        event(state, f"merged PR {w.pr_url}")
+                                        # Pull the merge commit so worktrees branch from updated HEAD
+                                        pull_proc = await asyncio.create_subprocess_exec(
+                                            "git", "pull", "--ff-only",
+                                            cwd=state.repo,
+                                            stdout=asyncio.subprocess.DEVNULL,
+                                            stderr=asyncio.subprocess.DEVNULL,
+                                        )
+                                        await pull_proc.communicate()
+                                    else:
+                                        err_msg = m_err.decode().strip()[:80] if m_err else "unknown error"
+                                        event(state, f"PR merge failed ({err_msg}) — queuing for merger agent")
+                                        if not state.merger_running and (merger_task is None or merger_task.done()):
+                                            async def _run_merger(refs=[w.pr_url]):
+                                                return await run_merger(
+                                                    state, refs,
+                                                    model=args.merger_model,
+                                                    budget=args.budget * 3,
+                                                    base_branch=args.base_branch,
+                                                    local=False,
+                                                )
+                                            merger_task = asyncio.create_task(_run_merger())
                             break
 
             # Refresh children after events
@@ -1032,6 +1496,17 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
             except (asyncio.CancelledError, Exception):
                 pass
             event(state, "planner cancelled")
+
+        # Kill merger too
+        if merger_task and not merger_task.done():
+            if state.merger_process and state.merger_process.returncode is None:
+                state.merger_process.kill()
+            merger_task.cancel()
+            try:
+                await merger_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            event(state, "merger cancelled")
 
         # Let in-flight workers finish (they're mid-PR, worth waiting)
         running = [t for t in worker_tasks.values() if not t.done()]
@@ -1113,6 +1588,10 @@ def parse_args() -> argparse.Namespace:
         help="Git repo path (default: cwd)",
     )
     parser.add_argument(
+        "--epic", default=None,
+        help="Resume from an existing epic ID (skip planner initial run)",
+    )
+    parser.add_argument(
         "--timeout", type=int, default=0,
         help="Per-worker timeout in minutes, 0 = no timeout (default: 0)",
     )
@@ -1129,8 +1608,28 @@ def parse_args() -> argparse.Namespace:
         help="Claude model for planner (default: opus)",
     )
     parser.add_argument(
+        "--merger-model", default="opus",
+        help="Claude model for merger agent (default: opus)",
+    )
+    parser.add_argument(
         "--budget", type=float, default=0,
         help="Max USD per worker session, 0 = unlimited (default: 0)",
+    )
+    parser.add_argument(
+        "--local", action="store_true", default=False,
+        help="Local mode: workers commit to branches, orchestrator merges locally (no GitHub PRs)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Run planner only, print tasks and dependencies, then exit",
+    )
+    parser.add_argument(
+        "--no-planner", action="store_true", default=False,
+        help="Disable automatic planner runs (use with --epic when tasks are pre-created)",
+    )
+    parser.add_argument(
+        "--design-doc", type=Path, default=None,
+        help="Parse dependency edges from a design doc (looks for 'depends on: PR N' patterns)",
     )
     parser.add_argument(
         "--git-name", default="Swarm",
@@ -1160,15 +1659,28 @@ async def async_main() -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     _log_file = log_dir / "swarm.log"
 
-    await verify_tools()
+    await verify_tools(local=args.local)
     await ensure_beads(repo)
 
     log(f'Starting swarm: "{args.task}"')
     log(f"  concurrency={args.concurrency}  target={args.target or 'unlimited'}"
         f"  timeout={args.timeout or 'none'}  model={args.model}  planner={args.planner_model}")
 
-    epic_id = await create_epic(args.task, repo)
-    log(f"Created epic: {epic_id}")
+    # Detect the base branch (whatever branch we're on when swarm starts)
+    base_branch_proc = await asyncio.create_subprocess_exec(
+        "git", "rev-parse", "--abbrev-ref", "HEAD",
+        cwd=repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    base_out, _ = await base_branch_proc.communicate()
+    args.base_branch = base_out.decode().strip() or "main"
+    log(f"Base branch: {args.base_branch}")
+
+    if args.epic:
+        epic_id = args.epic
+        log(f"Resuming epic: {epic_id}")
+    else:
+        epic_id = await create_epic(args.task, repo)
+        log(f"Created epic: {epic_id}")
 
     state = SwarmState(
         goal=args.task,
@@ -1193,6 +1705,11 @@ async def async_main() -> None:
             if state.planner_process and state.planner_process.returncode is None:
                 try:
                     state.planner_process.kill()
+                except Exception:
+                    pass
+            if state.merger_process and state.merger_process.returncode is None:
+                try:
+                    state.merger_process.kill()
                 except Exception:
                     pass
         else:
