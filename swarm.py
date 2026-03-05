@@ -1567,6 +1567,81 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                                             merger_task = asyncio.create_task(_run_merger())
                             break
 
+            # Periodically retry unmerged PRs/branches while merger is idle
+            if (not state.merger_running
+                    and (merger_task is None or merger_task.done())
+                    and state.tick % 20 == 0):  # every ~10s
+                try:
+                    unmerged = await get_mergeable_refs(
+                        state.epic_id, local=args.local, cwd=state.repo)
+                except Exception:
+                    unmerged = []
+                if unmerged:
+                    # Try auto-merging the backlog ourselves first
+                    still_failed = []
+                    for ref in unmerged:
+                        if args.local:
+                            rebase_proc = await asyncio.create_subprocess_exec(
+                                "git", "rebase", args.base_branch, ref,
+                                cwd=state.repo,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            await rebase_proc.communicate()
+                            if rebase_proc.returncode != 0:
+                                await asyncio.create_subprocess_exec(
+                                    "git", "rebase", "--abort", cwd=state.repo,
+                                    stdout=asyncio.subprocess.DEVNULL,
+                                    stderr=asyncio.subprocess.DEVNULL,
+                                )
+                            await asyncio.create_subprocess_exec(
+                                "git", "checkout", args.base_branch, cwd=state.repo,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
+                            )
+                            ff_proc = await asyncio.create_subprocess_exec(
+                                "git", "merge", "--ff-only", ref,
+                                cwd=state.repo,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            await ff_proc.communicate()
+                            if ff_proc.returncode == 0:
+                                event(state, f"retry-merged {ref} into {args.base_branch}")
+                            else:
+                                still_failed.append(ref)
+                        else:
+                            merge_proc = await asyncio.create_subprocess_exec(
+                                "gh", "pr", "merge", ref, "--merge",
+                                cwd=state.repo,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            await merge_proc.communicate()
+                            if merge_proc.returncode == 0:
+                                event(state, f"retry-merged PR {ref}")
+                                await asyncio.create_subprocess_exec(
+                                    "git", "pull", "--ff-only", cwd=state.repo,
+                                    stdout=asyncio.subprocess.DEVNULL,
+                                    stderr=asyncio.subprocess.DEVNULL,
+                                )
+                            else:
+                                still_failed.append(ref)
+                    # Spawn merger agent for remaining conflicts
+                    if still_failed:
+                        event(state, f"{len(still_failed)} unmerged refs — spawning merger")
+
+                        async def _run_merger_retry(refs=still_failed):
+                            return await run_merger(
+                                state, refs,
+                                model=args.merger_model,
+                                budget=args.budget * 3,
+                                base_branch=args.base_branch,
+                                local=args.local,
+                            )
+
+                        merger_task = asyncio.create_task(_run_merger_retry())
+
             # Refresh children after events
             try:
                 state.last_children = await get_all_children(
