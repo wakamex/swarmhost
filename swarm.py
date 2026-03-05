@@ -865,24 +865,43 @@ async def run_worker(
     )
     await p.communicate()
 
-    # Create worktree
-    proc = await asyncio.create_subprocess_exec(
-        "git", "worktree", "add", "-b", branch, str(worktree_dir),
-        cwd=state.repo,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        dur = time.monotonic() - worker.start_time
-        event(state, f"worker-{worker.slot} worktree failed: {stderr.decode().strip()[:80]}")
-        worker.result = "failed"
-        state.failed += 1
-        state.history.append(CompletedTask(
-            task.id, task.title, worker.slot, dur, "failed"))
-        await bd("update", task.id, "--status", "open", "--assignee", "",
-                 cwd=state.repo, check=False)
-        return
+    # Create worktree (retry once after cleanup race)
+    for attempt in range(2):
+        proc = await asyncio.create_subprocess_exec(
+            "git", "worktree", "add", "-b", branch, str(worktree_dir),
+            cwd=state.repo,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            break
+        if attempt == 0:
+            # Cleanup race — prune and retry
+            await asyncio.create_subprocess_exec(
+                "git", "worktree", "prune",
+                cwd=state.repo,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.sleep(0.5)
+            # Re-delete branch in case prune freed it
+            await asyncio.create_subprocess_exec(
+                "git", "branch", "-D", branch,
+                cwd=state.repo,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        else:
+            dur = time.monotonic() - worker.start_time
+            event(state, f"worker-{worker.slot} worktree failed: {stderr.decode().strip()[:80]}")
+            worker.result = "failed"
+            state.failed += 1
+            state.history.append(CompletedTask(
+                task.id, task.title, worker.slot, dur, "failed"))
+            await bd("update", task.id, "--status", "open", "--assignee", "",
+                     cwd=state.repo, check=False)
+            return
 
     # Set git identity in the worktree so all commits use it
     await asyncio.create_subprocess_exec(
