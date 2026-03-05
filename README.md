@@ -11,7 +11,7 @@ The key insight is **separation of concerns across four roles**:
 - The **orchestrator** (Python, no AI) manages processes, worktrees, and lifecycle — it never makes decisions about *what* to build
 - The **planner** (Claude, spawned on-demand) has full codebase access and decides *what* to build next — it creates batches of well-scoped tasks
 - The **workers** (Claude, one per task) each get an isolated git worktree and a single task — they implement, test, commit, and close
-- The **merger** (Claude, spawned when stuck) resolves merge conflicts and reviews when branches can't be auto-merged
+- The **merger** (Claude, shares the worker queue) resolves merge conflicts when the orchestrator's simple auto-merge fails — it gets a worktree checked out to the conflicting branch and rebases it
 
 All coordination happens through beads, a local issue tracker. Every role is stateless — the planner, workers, and merger are each a fresh `claude -p` invocation, and the orchestrator keeps no persistent state of its own. Kill it and restart, and it picks up where it left off by querying beads. Each worker is isolated in its own git worktree, so concurrent agents never step on each other's files.
 
@@ -85,7 +85,7 @@ python swarm.py <goal> [flags]
 | `--refill` | concurrency | Ready-task threshold that triggers the planner |
 | `--model` | sonnet | Claude model for workers |
 | `--planner-model` | opus | Claude model for the planner |
-| `--merger-model` | opus | Claude model for the merger |
+| `--merger-model` | same as `--model` | Claude model for conflict-resolution workers |
 | `--budget` | 0 | Max USD per worker session (0 = unlimited) |
 | `--local` | false | Skip GitHub PRs; commit locally, merge onto base branch |
 | `--no-planner` | false | Disable automatic planner refills (use with `--epic`) |
@@ -116,21 +116,22 @@ while not done:
 
     if ready_count == 0 and no workers running:
         if planner running: wait for it
-        if mergeable branches exist: spawn merger, then re-check
+        if unmerged refs: try simple merge, queue failures for conflict workers
         else: exit (nothing left)
 
     for each idle worker slot:
-        assign next ready task
+        if pending conflict: assign conflict-resolution worker (priority)
+        else: assign next ready task
         create isolated git worktree
         spawn worker in background
 
     on worker finish:
         auto-close bead if worker made commits but forgot
-        auto-merge (git merge in --local, gh pr merge in PR mode)
-        on merge failure: spawn merger agent
+        auto-merge (rebase+ff in --local, gh pr merge in PR mode)
+        on merge failure: queue for conflict-resolution worker
         cleanup worktree
 
-    wait for any worker/planner/merger to finish
+    wait for any worker/planner to finish
 ```
 
 ### Worker isolation
@@ -187,11 +188,11 @@ The orchestrator streams `--output-format stream-json` from each Claude subproce
 
 ### Two-mode operation
 
-In both modes, the orchestrator auto-merges completed work immediately so successor workers always branch from a codebase that includes their dependencies. On merge failure, the merger agent is spawned to resolve it.
+In both modes, the orchestrator auto-merges completed work immediately so successor workers always branch from a codebase that includes their dependencies. On merge failure, the orchestrator queues a conflict-resolution worker — a regular worker slot given a rebase-and-resolve prompt instead of a beads task.
 
-**PR mode** (default): Workers push branches and create GitHub PRs via `gh pr create`. The orchestrator auto-merges each PR via `gh pr merge --merge` and pulls the result locally. If the merge fails (conflicts, CI checks, branch protection), the merger agent reviews and resolves.
+**PR mode** (default): Workers push branches and create GitHub PRs via `gh pr create`. The orchestrator auto-merges each PR via `gh pr merge --merge` and pulls the result locally. If the merge fails (conflicts, CI checks, branch protection), a conflict-resolution worker rebases the PR branch and force-pushes the fix.
 
-**Local mode** (`--local`): Workers commit to local branches. The orchestrator auto-merges via `git merge --no-edit`. On merge conflicts, the merger agent resolves them locally. No GitHub interaction needed — useful for monorepos, private work, or fast iteration.
+**Local mode** (`--local`): Workers commit to local branches. The orchestrator auto-merges via `git rebase` + `git merge --ff-only`. On merge conflicts, a conflict-resolution worker rebases the branch and resolves them. No GitHub interaction needed — useful for monorepos, private work, or fast iteration.
 
 ### Graceful shutdown
 

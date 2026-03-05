@@ -93,6 +93,7 @@ class WorkerState:
     result: str = "idle"  # idle, running, success, failed, timeout
     pr_url: str = ""
     last_line: str = ""
+    conflict_ref: str = ""  # non-empty when resolving a merge conflict
 
 
 @dataclass
@@ -109,10 +110,6 @@ class SwarmState:
     planner_start_time: float = 0.0
     planner_process: asyncio.subprocess.Process | None = None
     planner_runs: int = 0
-    merger_running: bool = False
-    merger_start_time: float = 0.0
-    merger_process: asyncio.subprocess.Process | None = None
-    merger_runs: int = 0
     start_time: float = field(default_factory=time.monotonic)
     shutdown: bool = False      # first Ctrl-C: drain
     force_quit: bool = False    # second Ctrl-C: kill now
@@ -121,7 +118,6 @@ class SwarmState:
     tick: int = 0  # animation frame counter
     last_children: list[dict] = field(default_factory=list)
     planner_last_line: str = ""
-    merger_last_line: str = ""
 
 
 # ── Stream helper ────────────────────────────────────────────────────────────
@@ -343,12 +339,20 @@ def render_status(state: SwarmState) -> str:
         if w.result == "running" and w.task:
             wt = fmt_elapsed(now - w.start_time)
             spin = SPINNER[tick % len(SPINNER)]
-            title = truncate(w.task.title, 45)
-            lines.append(
-                f"  {C.YELLOW}{spin}{C.RESET} {C.DIM}worker-{w.slot}{C.RESET}"
-                f"  {w.task.id}  {title}"
-                f"  {C.DIM}{wt}{C.RESET}"
-            )
+            if w.conflict_ref:
+                title = truncate(w.task.title, 45)
+                lines.append(
+                    f"  {C.BLUE}{spin}{C.RESET} {C.DIM}worker-{w.slot}{C.RESET}"
+                    f"  {C.BLUE}merge{C.RESET}  {title}"
+                    f"  {C.DIM}{wt}{C.RESET}"
+                )
+            else:
+                title = truncate(w.task.title, 45)
+                lines.append(
+                    f"  {C.YELLOW}{spin}{C.RESET} {C.DIM}worker-{w.slot}{C.RESET}"
+                    f"  {w.task.id}  {title}"
+                    f"  {C.DIM}{wt}{C.RESET}"
+                )
             if w.last_line:
                 lines.append(f"    {C.DIM}{truncate(w.last_line, 72)}{C.RESET}")
         elif w.result == "success" and w.task:
@@ -379,15 +383,6 @@ def render_status(state: SwarmState) -> str:
             lines.append(f"    {C.DIM}{truncate(state.planner_last_line, 72)}{C.RESET}")
     else:
         lines.append(f"  {C.DIM}  planner  idle  ({state.planner_runs} runs){C.RESET}")
-
-    if state.merger_running:
-        spin = SPINNER[tick % len(SPINNER)]
-        mt = fmt_elapsed(now - state.merger_start_time)
-        lines.append(f"  {C.BLUE}{spin}{C.RESET} {C.BLUE}merger{C.RESET}   reviewing  {C.DIM}{mt}{C.RESET}")
-        if state.merger_last_line:
-            lines.append(f"    {C.DIM}{truncate(state.merger_last_line, 72)}{C.RESET}")
-    elif state.merger_runs > 0:
-        lines.append(f"  {C.DIM}  merger   idle  ({state.merger_runs} runs){C.RESET}")
 
     # Event log
     if state.events:
@@ -515,122 +510,6 @@ async def run_planner(
         state.planner_process = None
 
 
-# ── Merger ───────────────────────────────────────────────────────────────
-
-def build_merger_prompt(goal: str, epic_id: str, refs: list[str], base_branch: str, *, local: bool = False) -> str:
-    ref_list = "\n".join(f"  - {r}" for r in refs)
-
-    if local:
-        return f"""\
-You are a merger agent for a swarm of AI coding agents. Workers have completed
-tasks and committed to local branches. Your job is to review and merge them
-into the base branch so that dependent tasks can proceed.
-
-## High-level goal
-
-{goal}
-
-## Base branch
-
-`{base_branch}`
-
-## Branches to review and merge
-
-{ref_list}
-
-## Instructions
-
-For each branch above:
-
-1. Review the diff against base:
-   git log {base_branch}..<branch> --oneline
-   git diff {base_branch}...<branch>
-
-2. Check that it looks reasonable:
-   - Code follows existing patterns and conventions
-   - No obvious bugs, security issues, or broken imports
-   - The change is focused and matches a single task
-   - No unrelated changes snuck in
-
-3. Merge the branch cleanly (no merge commits):
-   git rebase {base_branch} <branch>
-   git checkout {base_branch}
-   git merge --ff-only <branch>
-   Then run the project's test suite (check package.json / Makefile / pyproject.toml).
-
-4. If the rebase + tests pass, you're done with this branch. Move to the next.
-
-5. If the branch has issues:
-   - Undo the merge: git reset --hard HEAD~1
-   - Find the beads task ID by checking:
-     bd list --parent {epic_id} --all --json
-     (look for the closed task whose close_reason mentions this branch)
-   - Reopen it with feedback:
-     bd reopen <id>
-     bd update <id> --append-notes "Merger feedback: <what needs fixing>"
-
-Process them in dependency order — if branch A's code is needed by branch B,
-merge A first.
-
-Review the current task state to understand dependencies:
-  bd list --parent {epic_id} --all --json
-"""
-    else:
-        return f"""\
-You are a merger agent for a swarm of AI coding agents. Workers have completed
-tasks and created PRs. Your job is to review and merge them so that dependent
-tasks can proceed.
-
-## High-level goal
-
-{goal}
-
-## Base branch
-
-All PRs target: `{base_branch}`
-
-## PRs to review and merge
-
-{ref_list}
-
-## Instructions
-
-For each PR above:
-
-1. Review the diff:
-   gh pr diff <number>
-
-2. Check that it looks reasonable:
-   - Code follows existing patterns and conventions
-   - No obvious bugs, security issues, or broken imports
-   - Tests are included and pass
-   - The change matches what the PR title/body describes
-   - No unrelated changes snuck in
-
-3. Run the test suite to verify nothing is broken:
-   npm run test:unit  (or whatever the project uses — check package.json / Makefile)
-
-4. If the PR looks good, merge it:
-   gh pr merge <number> --squash --delete-branch
-
-5. If the PR has issues, close it and reopen the beads task with notes:
-   gh pr close <number> --comment "Issues found: <description>"
-   Then find the beads task ID from the PR body (it says "Implements <id>")
-   and reopen it with notes so the next worker knows what to fix:
-   bd reopen <id>
-   bd update <id> --append-notes "Merger feedback: <what needs fixing>"
-
-6. After merging all good PRs, update the base branch:
-   git pull origin {base_branch}
-
-Process them in dependency order — if PR A's code is needed by PR B,
-merge A first.
-
-Review the current task state to understand dependencies:
-  bd list --parent {epic_id} --all --json
-"""
-
-
 async def get_blocked_tasks(epic_id: str, cwd: Path | None = None) -> list[dict]:
     """Get tasks that are blocked (have unresolved dependencies)."""
     data = await bd_json("blocked", cwd=cwd)
@@ -699,70 +578,254 @@ async def get_mergeable_refs(epic_id: str, *, local: bool = False, cwd: Path | N
     return mergeable
 
 
-async def run_merger(
+# ── Merge helpers ────────────────────────────────────────────────────────────
+
+async def try_merge_ref(
+    ref: str,
+    *,
+    base_branch: str,
+    local: bool,
+    cwd: Path,
+) -> bool:
+    """Try a simple merge of a ref (branch name or PR URL). Returns True on success."""
+    if local:
+        rebase = await asyncio.create_subprocess_exec(
+            "git", "rebase", base_branch, ref,
+            cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await rebase.communicate()
+        if rebase.returncode != 0:
+            await asyncio.create_subprocess_exec(
+                "git", "rebase", "--abort", cwd=cwd,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            return False
+        await asyncio.create_subprocess_exec(
+            "git", "checkout", base_branch, cwd=cwd,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        ff = await asyncio.create_subprocess_exec(
+            "git", "merge", "--ff-only", ref,
+            cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await ff.communicate()
+        return ff.returncode == 0
+    else:
+        merge = await asyncio.create_subprocess_exec(
+            "gh", "pr", "merge", ref, "--merge",
+            cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await merge.communicate()
+        if merge.returncode == 0:
+            pull = await asyncio.create_subprocess_exec(
+                "git", "pull", "--ff-only", cwd=cwd,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await pull.communicate()
+            return True
+        return False
+
+
+def build_conflict_prompt(ref: str, base_branch: str, *, local: bool = False) -> str:
+    """Build a prompt for a conflict-resolution worker."""
+    if local:
+        return f"""\
+You are a conflict-resolution agent. A worker branch has merge conflicts
+with the base branch that need to be resolved.
+
+## Your branch
+
+You are on branch `{ref}`. It needs to be rebased onto `{base_branch}`.
+
+## Instructions
+
+1. Rebase this branch onto the base branch:
+   git rebase {base_branch}
+
+2. If there are merge conflicts, resolve them:
+   - Read the conflicting files to understand both sides
+   - Resolve each conflict preserving the intent of both changes
+   - `git add` resolved files
+   - `git rebase --continue`
+   - Repeat until the rebase is complete
+
+3. Run the project's test suite to verify nothing is broken.
+   Fix any test failures your conflict resolution introduced.
+
+4. When done, verify: `git status` should show a clean working tree
+   on the rebased branch, and `git log --oneline {base_branch}..HEAD`
+   should show the branch's commits cleanly on top of {base_branch}.
+"""
+    else:
+        return f"""\
+You are a conflict-resolution agent. A PR has merge conflicts with the
+base branch that need to be resolved.
+
+## PR to fix
+
+{ref}
+
+## Base branch
+
+`{base_branch}`
+
+## Instructions
+
+1. Check the current branch (it's already checked out for you):
+   git log --oneline -5
+
+2. Fetch and rebase onto the base branch:
+   git fetch origin {base_branch}
+   git rebase origin/{base_branch}
+
+3. If there are merge conflicts, resolve them:
+   - Read the conflicting files to understand both sides
+   - Resolve each conflict preserving the intent of both changes
+   - `git add` resolved files
+   - `git rebase --continue`
+   - Repeat until the rebase is complete
+
+4. Run the project's test suite to verify nothing is broken.
+   Fix any test failures your conflict resolution introduced.
+
+5. Force-push the rebased branch to update the PR:
+   git push --force-with-lease
+"""
+
+
+async def run_conflict_worker(
     state: SwarmState,
-    refs: list[str],
+    worker: WorkerState,
+    ref: str,
     *,
     model: str,
     budget: float,
+    timeout: int,
     base_branch: str,
     local: bool = False,
 ) -> None:
-    """Spawn a merger Claude session to review and merge PRs or local branches."""
-    prompt = build_merger_prompt(state.goal, state.epic_id, refs, base_branch, local=local)
+    """Run a conflict-resolution worker in a worktree checked out to the conflicting branch."""
+    worker.task = Task(id="merge", title=f"Resolve: {ref[:50]}", description="", status="in_progress")
+    worker.result = "running"
+    worker.start_time = time.monotonic()
+    worker.conflict_ref = ref
+    worker.pr_url = ""
 
+    worktree_dir = state.repo / ".swarm" / "worktrees" / f"worker-{worker.slot}"
+    worker.worktree = worktree_dir
+
+    event(state, f"worker-{worker.slot} resolving conflicts on {ref[:60]}")
+
+    # Determine branch name for worktree checkout
+    if local:
+        branch = ref
+    else:
+        # Extract branch name from PR URL
+        pr_view = await asyncio.create_subprocess_exec(
+            "gh", "pr", "view", ref, "--json", "headRefName", "-q", ".headRefName",
+            cwd=state.repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await pr_view.communicate()
+        branch = out.decode().strip()
+        if not branch:
+            event(state, f"worker-{worker.slot} could not determine PR branch for {ref}")
+            worker.result = "failed"
+            worker.conflict_ref = ""
+            return
+        # Ensure branch exists locally
+        await asyncio.create_subprocess_exec(
+            "git", "fetch", "origin", branch,
+            cwd=state.repo, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+
+    worker.branch = branch
+
+    # Clean up stale worktree at this path
+    if worktree_dir.exists():
+        try:
+            p = await asyncio.create_subprocess_exec(
+                "git", "worktree", "remove", "--force", str(worktree_dir),
+                cwd=state.repo, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await p.communicate()
+        except Exception:
+            pass
+
+    # Create worktree from the conflicting branch
+    proc = await asyncio.create_subprocess_exec(
+        "git", "worktree", "add", str(worktree_dir), branch,
+        cwd=state.repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        # For PR mode, the local branch might not exist — try from origin
+        if not local:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "worktree", "add", str(worktree_dir), f"origin/{branch}",
+                cwd=state.repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            event(state, f"worker-{worker.slot} conflict worktree failed: {stderr.decode().strip()[:80]}")
+            worker.result = "failed"
+            worker.conflict_ref = ""
+            return
+
+    prompt = build_conflict_prompt(ref, base_branch, local=local)
     cmd = [
         "claude", "-p",
         "--output-format", "stream-json", "--verbose",
         "--model", model,
-        "--allowedTools", "Bash Read Glob Grep",
+        "--allowedTools", "Bash Read Write Edit Glob Grep",
         "--dangerously-skip-permissions",
     ]
     if budget > 0:
         cmd.extend(["--max-budget-usd", str(budget)])
 
-    state.merger_running = True
-    state.merger_start_time = time.monotonic()
-    state.merger_runs += 1
-    state.merger_last_line = ""
-    event(state, f"merger reviewing {len(refs)} refs")
     try:
-        proc = await asyncio.create_subprocess_exec(
+        worker_proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=state.repo,
+            cwd=worktree_dir,
             env=_CLAUDE_ENV,
             limit=10 * 1024 * 1024,
         )
-        state.merger_process = proc
+        worker.process = worker_proc
 
         def _on_line(text: str) -> None:
-            state.merger_last_line = text
+            worker.last_line = text
 
-        output = await stream_output(proc, prompt.encode(), _on_line)
-        dur = time.monotonic() - state.merger_start_time
-
-        if proc.returncode != 0:
-            event(state, f"merger exited with code {proc.returncode} ({fmt_elapsed(dur)})")
+        if timeout > 0:
+            try:
+                await asyncio.wait_for(
+                    stream_output(worker_proc, prompt.encode(), _on_line),
+                    timeout=timeout * 60,
+                )
+            except asyncio.TimeoutError:
+                worker_proc.kill()
+                await worker_proc.wait()
+                dur = time.monotonic() - worker.start_time
+                event(state, f"worker-{worker.slot} conflict TIMEOUT after {fmt_elapsed(dur)}")
+                worker.result = "timeout"
+                return
         else:
-            event(state, f"merger finished ({fmt_elapsed(dur)})")
+            await stream_output(worker_proc, prompt.encode(), _on_line)
 
-        # In PR mode, pull to pick up remote merges; in local mode merger
-        # already merged locally so just ensure we're on the base branch
-        if not local:
-            pull = await asyncio.create_subprocess_exec(
-                "git", "pull", "origin", base_branch,
-                cwd=state.repo,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await pull.communicate()
+        dur = time.monotonic() - worker.start_time
+        if worker_proc.returncode == 0:
+            worker.result = "success"
+            event(state, f"worker-{worker.slot} conflict resolved ({fmt_duration_short(dur)})")
+        else:
+            worker.result = "failed"
+            event(state, f"worker-{worker.slot} conflict resolution failed ({fmt_duration_short(dur)})")
 
+    except Exception as exc:
+        worker.result = "failed"
+        event(state, f"worker-{worker.slot} conflict exception: {exc}")
     finally:
-        state.merger_running = False
-        state.merger_process = None
+        worker.process = None
 
 
 # ── Worker ───────────────────────────────────────────────────────────────────
@@ -1234,8 +1297,8 @@ async def display_loop(state: SwarmState) -> None:
 async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
     refill_threshold = args.refill if args.refill > 0 else state.concurrency
     planner_task: asyncio.Task | None = None
-    merger_task: asyncio.Task | None = None
     worker_tasks: dict[int, asyncio.Task] = {}  # slot -> asyncio.Task
+    pending_conflicts: list[str] = []  # refs needing conflict resolution
 
     # Start the display refresh loop
     display_task = asyncio.create_task(display_loop(state))
@@ -1369,8 +1432,8 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                         break
                     continue
 
-                # Check if merger can unblock progress
-                if not state.merger_running and (merger_task is None or merger_task.done()):
+                # Check if unmerged refs can unblock progress
+                if not pending_conflicts:
                     try:
                         mergeable = await get_mergeable_refs(
                             state.epic_id, local=args.local, cwd=state.repo)
@@ -1379,37 +1442,33 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                         mergeable = []
 
                     if mergeable:
-                        label = "branches" if args.local else "PRs"
-                        event(state, f"blocked — spawning merger for {len(mergeable)} {label}")
+                        # Try simple merge first, queue failures for conflict workers
+                        active_refs = {w.conflict_ref for w in state.workers if w.conflict_ref}
+                        for ref in mergeable:
+                            if ref in active_refs:
+                                continue
+                            merged = await try_merge_ref(
+                                ref, base_branch=args.base_branch,
+                                local=args.local, cwd=state.repo)
+                            if merged:
+                                event(state, f"merged {ref[:60]}")
+                            else:
+                                pending_conflicts.append(ref)
+                        if pending_conflicts:
+                            continue  # assign conflict workers in task assignment
 
-                        async def _run_merger(refs=mergeable):
-                            return await run_merger(
-                                state, refs,
-                                model=args.merger_model,
-                                budget=args.budget * 3,
-                                base_branch=args.base_branch,
-                                local=args.local,
-                            )
-
-                        merger_task = asyncio.create_task(_run_merger())
-                        # After spawning merger, loop back to re-check
-                        continue
-
-                # If merger is running, wait for it
-                if state.merger_running and merger_task and not merger_task.done():
-                    event(state, "no tasks — waiting for merger to unblock")
-                    await merger_task
-                    merger_task = None
-                    # Re-check ready tasks after merge
-                    ready = await get_ready_tasks(state.epic_id, cwd=state.repo)
-                    if ready:
-                        continue
-                    # Still stuck — fall through
+                # If there are conflict workers still running, wait for them
+                conflict_workers = [t for s, t in worker_tasks.items()
+                                    if not t.done() and state.workers[s].conflict_ref]
+                if conflict_workers:
+                    event(state, f"waiting for {len(conflict_workers)} conflict workers")
+                    await asyncio.wait(conflict_workers, return_when=asyncio.FIRST_COMPLETED)
+                    continue
 
                 event(state, "no tasks, no workers, planner idle — done")
                 break
 
-            # Assign tasks to idle worker slots
+            # Assign tasks to idle worker slots (conflicts first, then regular tasks)
             ready_idx = 0
             for w in state.workers:
                 if state.target > 0 and state.completed >= state.target:
@@ -1417,14 +1476,31 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                 slot = w.slot
                 if slot in worker_tasks and not worker_tasks[slot].done():
                     continue
+
+                if slot in worker_tasks and worker_tasks[slot].done():
+                    await cleanup_worktree(state, w)
+
+                # Priority 1: conflict resolution
+                if pending_conflicts:
+                    ref = pending_conflicts.pop(0)
+                    worker_tasks[slot] = asyncio.create_task(
+                        run_conflict_worker(
+                            state, w, ref,
+                            model=args.merger_model,
+                            budget=args.budget,
+                            timeout=args.timeout,
+                            base_branch=args.base_branch,
+                            local=args.local,
+                        )
+                    )
+                    continue
+
+                # Priority 2: regular beads tasks
                 if ready_idx >= len(ready):
                     break
 
                 task = ready[ready_idx]
                 ready_idx += 1
-
-                if slot in worker_tasks and worker_tasks[slot].done():
-                    await cleanup_worktree(state, w)
 
                 worker_tasks[slot] = asyncio.create_task(
                     run_worker(
@@ -1446,8 +1522,6 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                     pending.add(t)
             if planner_task and not planner_task.done():
                 pending.add(planner_task)
-            if merger_task and not merger_task.done():
-                pending.add(merger_task)
 
             if not pending:
                 await asyncio.sleep(1)
@@ -1473,12 +1547,6 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                         event(state, "planner cooldown 30s before retry")
                         await asyncio.sleep(30)
                     planner_task = None
-                elif merger_task and t is merger_task:
-                    try:
-                        t.result()
-                    except Exception as exc:
-                        event(state, f"merger failed: {exc}")
-                    merger_task = None
                 else:
                     for slot, wt in worker_tasks.items():
                         if wt is t:
@@ -1486,161 +1554,55 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                                 t.result()
                             except Exception as exc:
                                 event(state, f"worker-{slot} raised: {exc}")
-                            # Auto-merge completed worker's branch/PR
                             w = state.workers[slot]
-                            if w.result == "success":
-                                if args.local and w.branch:
-                                    # Local mode: rebase onto base then fast-forward
-                                    rebase_proc = await asyncio.create_subprocess_exec(
-                                        "git", "rebase", args.base_branch, w.branch,
-                                        cwd=state.repo,
-                                        stdout=asyncio.subprocess.PIPE,
-                                        stderr=asyncio.subprocess.PIPE,
-                                    )
-                                    await rebase_proc.communicate()
-                                    if rebase_proc.returncode != 0:
-                                        await asyncio.create_subprocess_exec(
-                                            "git", "rebase", "--abort",
-                                            cwd=state.repo,
-                                            stdout=asyncio.subprocess.DEVNULL,
-                                            stderr=asyncio.subprocess.DEVNULL,
-                                        )
-                                    # Switch back to base branch and fast-forward
-                                    await asyncio.create_subprocess_exec(
-                                        "git", "checkout", args.base_branch,
-                                        cwd=state.repo,
-                                        stdout=asyncio.subprocess.DEVNULL,
-                                        stderr=asyncio.subprocess.DEVNULL,
-                                    )
-                                    ff_proc = await asyncio.create_subprocess_exec(
-                                        "git", "merge", "--ff-only", w.branch,
-                                        cwd=state.repo,
-                                        stdout=asyncio.subprocess.PIPE,
-                                        stderr=asyncio.subprocess.PIPE,
-                                    )
-                                    m_out, m_err = await ff_proc.communicate()
-                                    if ff_proc.returncode == 0:
-                                        event(state, f"merged {w.branch} into {args.base_branch}")
+
+                            if w.conflict_ref:
+                                # Conflict worker finished — retry merge
+                                ref = w.conflict_ref
+                                w.conflict_ref = ""
+                                if w.result == "success":
+                                    merged = await try_merge_ref(
+                                        ref, base_branch=args.base_branch,
+                                        local=args.local, cwd=state.repo)
+                                    if merged:
+                                        event(state, f"merged {ref[:60]} after conflict resolution")
                                     else:
-                                        event(state, f"ff-merge failed on {w.branch} — queuing for merger agent")
-                                        if not state.merger_running and (merger_task is None or merger_task.done()):
-                                            async def _run_merger(refs=[w.branch]):
-                                                return await run_merger(
-                                                    state, refs,
-                                                    model=args.merger_model,
-                                                    budget=args.budget * 3,
-                                                    base_branch=args.base_branch,
-                                                    local=True,
-                                                )
-                                            merger_task = asyncio.create_task(_run_merger())
-                                elif not args.local and w.pr_url:
-                                    # PR mode: gh pr merge
-                                    merge_proc = await asyncio.create_subprocess_exec(
-                                        "gh", "pr", "merge", w.pr_url, "--merge",
-                                        cwd=state.repo,
-                                        stdout=asyncio.subprocess.PIPE,
-                                        stderr=asyncio.subprocess.PIPE,
-                                    )
-                                    m_out, m_err = await merge_proc.communicate()
-                                    if merge_proc.returncode == 0:
-                                        event(state, f"merged PR {w.pr_url}")
-                                        # Pull the merge commit so worktrees branch from updated HEAD
-                                        pull_proc = await asyncio.create_subprocess_exec(
-                                            "git", "pull", "--ff-only",
-                                            cwd=state.repo,
-                                            stdout=asyncio.subprocess.DEVNULL,
-                                            stderr=asyncio.subprocess.DEVNULL,
-                                        )
-                                        await pull_proc.communicate()
+                                        event(state, f"merge still failing for {ref[:60]} — re-queuing")
+                                        pending_conflicts.append(ref)
+                                await cleanup_worktree(state, w)
+                            elif w.result == "success":
+                                # Regular worker — auto-merge
+                                merge_ref = w.branch if args.local else w.pr_url
+                                if merge_ref:
+                                    merged = await try_merge_ref(
+                                        merge_ref, base_branch=args.base_branch,
+                                        local=args.local, cwd=state.repo)
+                                    if merged:
+                                        event(state, f"merged {merge_ref[:60]}")
                                     else:
-                                        err_msg = m_err.decode().strip()[:80] if m_err else "unknown error"
-                                        event(state, f"PR merge failed ({err_msg}) — queuing for merger agent")
-                                        if not state.merger_running and (merger_task is None or merger_task.done()):
-                                            async def _run_merger(refs=[w.pr_url]):
-                                                return await run_merger(
-                                                    state, refs,
-                                                    model=args.merger_model,
-                                                    budget=args.budget * 3,
-                                                    base_branch=args.base_branch,
-                                                    local=False,
-                                                )
-                                            merger_task = asyncio.create_task(_run_merger())
+                                        event(state, f"merge failed for {merge_ref[:60]} — queuing conflict worker")
+                                        pending_conflicts.append(merge_ref)
                             break
 
-            # Periodically retry unmerged PRs/branches while merger is idle
-            if (not state.merger_running
-                    and (merger_task is None or merger_task.done())
-                    and state.tick % 20 == 0):  # every ~10s
+            # Periodically retry unmerged refs (simple merge first, then queue conflicts)
+            if state.tick % 20 == 0:  # every ~10s
+                active_refs = {w.conflict_ref for w in state.workers if w.conflict_ref}
+                queued_refs = set(pending_conflicts)
                 try:
                     unmerged = await get_mergeable_refs(
                         state.epic_id, local=args.local, cwd=state.repo)
                 except Exception:
                     unmerged = []
-                if unmerged:
-                    # Try auto-merging the backlog ourselves first
-                    still_failed = []
-                    for ref in unmerged:
-                        if args.local:
-                            rebase_proc = await asyncio.create_subprocess_exec(
-                                "git", "rebase", args.base_branch, ref,
-                                cwd=state.repo,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
-                            )
-                            await rebase_proc.communicate()
-                            if rebase_proc.returncode != 0:
-                                await asyncio.create_subprocess_exec(
-                                    "git", "rebase", "--abort", cwd=state.repo,
-                                    stdout=asyncio.subprocess.DEVNULL,
-                                    stderr=asyncio.subprocess.DEVNULL,
-                                )
-                            await asyncio.create_subprocess_exec(
-                                "git", "checkout", args.base_branch, cwd=state.repo,
-                                stdout=asyncio.subprocess.DEVNULL,
-                                stderr=asyncio.subprocess.DEVNULL,
-                            )
-                            ff_proc = await asyncio.create_subprocess_exec(
-                                "git", "merge", "--ff-only", ref,
-                                cwd=state.repo,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
-                            )
-                            await ff_proc.communicate()
-                            if ff_proc.returncode == 0:
-                                event(state, f"retry-merged {ref} into {args.base_branch}")
-                            else:
-                                still_failed.append(ref)
-                        else:
-                            merge_proc = await asyncio.create_subprocess_exec(
-                                "gh", "pr", "merge", ref, "--merge",
-                                cwd=state.repo,
-                                stdout=asyncio.subprocess.PIPE,
-                                stderr=asyncio.subprocess.PIPE,
-                            )
-                            await merge_proc.communicate()
-                            if merge_proc.returncode == 0:
-                                event(state, f"retry-merged PR {ref}")
-                                await asyncio.create_subprocess_exec(
-                                    "git", "pull", "--ff-only", cwd=state.repo,
-                                    stdout=asyncio.subprocess.DEVNULL,
-                                    stderr=asyncio.subprocess.DEVNULL,
-                                )
-                            else:
-                                still_failed.append(ref)
-                    # Spawn merger agent for remaining conflicts
-                    if still_failed:
-                        event(state, f"{len(still_failed)} unmerged refs — spawning merger")
-
-                        async def _run_merger_retry(refs=still_failed):
-                            return await run_merger(
-                                state, refs,
-                                model=args.merger_model,
-                                budget=args.budget * 3,
-                                base_branch=args.base_branch,
-                                local=args.local,
-                            )
-
-                        merger_task = asyncio.create_task(_run_merger_retry())
+                for ref in unmerged:
+                    if ref in active_refs or ref in queued_refs:
+                        continue
+                    merged = await try_merge_ref(
+                        ref, base_branch=args.base_branch,
+                        local=args.local, cwd=state.repo)
+                    if merged:
+                        event(state, f"retry-merged {ref[:60]}")
+                    else:
+                        pending_conflicts.append(ref)
 
             # Refresh children after events
             try:
@@ -1663,17 +1625,6 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
             except (asyncio.CancelledError, Exception):
                 pass
             event(state, "planner cancelled")
-
-        # Kill merger too
-        if merger_task and not merger_task.done():
-            if state.merger_process and state.merger_process.returncode is None:
-                state.merger_process.kill()
-            merger_task.cancel()
-            try:
-                await merger_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            event(state, "merger cancelled")
 
         # Let in-flight workers finish (they're mid-PR, worth waiting)
         running = [t for t in worker_tasks.values() if not t.done()]
@@ -1775,8 +1726,8 @@ def parse_args() -> argparse.Namespace:
         help="Claude model for planner (default: opus)",
     )
     parser.add_argument(
-        "--merger-model", default="opus",
-        help="Claude model for merger agent (default: opus)",
+        "--merger-model", default=None,
+        help="Claude model for conflict-resolution workers (default: same as --model)",
     )
     parser.add_argument(
         "--budget", type=float, default=0,
@@ -1820,6 +1771,8 @@ async def async_main() -> None:
         sys.exit(1)
 
     repo = args.repo.resolve()
+    if args.merger_model is None:
+        args.merger_model = args.model
 
     global _log_file
     log_dir = repo / ".swarm"
@@ -1875,11 +1828,6 @@ async def async_main() -> None:
             if state.planner_process and state.planner_process.returncode is None:
                 try:
                     state.planner_process.kill()
-                except Exception:
-                    pass
-            if state.merger_process and state.merger_process.returncode is None:
-                try:
-                    state.merger_process.kill()
                 except Exception:
                     pass
         else:
