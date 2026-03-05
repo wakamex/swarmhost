@@ -1342,6 +1342,8 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
     pending_conflicts: list[str] = []  # refs needing conflict resolution
     conventions_text = args.conventions.read_text().strip() if args.conventions else ""
     recent_titles: list[str] = []  # titles of recently completed tasks
+    assigned_ids: set[str] = set()  # task IDs currently assigned to workers
+    planner_cooldown_until: float = 0  # monotonic time before which planner won't respawn
 
     # Start the display refresh loop
     display_task = asyncio.create_task(display_loop(state))
@@ -1447,7 +1449,8 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
             if (not args.no_planner
                     and ready_count < refill_threshold
                     and not state.planner_running
-                    and (planner_task is None or planner_task.done())):
+                    and (planner_task is None or planner_task.done())
+                    and time.monotonic() >= planner_cooldown_until):
                 event(state, f"queue low ({ready_count}<{refill_threshold}), spawning planner")
 
                 async def _run_planner():
@@ -1539,11 +1542,14 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                     continue
 
                 # Priority 2: regular beads tasks
+                while ready_idx < len(ready) and ready[ready_idx].id in assigned_ids:
+                    ready_idx += 1
                 if ready_idx >= len(ready):
                     break
 
                 task = ready[ready_idx]
                 ready_idx += 1
+                assigned_ids.add(task.id)
 
                 worker_tasks[slot] = asyncio.create_task(
                     run_worker(
@@ -1589,8 +1595,8 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                                 event(state, f"applied {n} dependency edges from {args.design_doc.name}")
                     except Exception as exc:
                         event(state, f"planner failed: {exc}")
+                        planner_cooldown_until = time.monotonic() + 30
                         event(state, "planner cooldown 30s before retry")
-                        await asyncio.sleep(30)
                     planner_task = None
                 else:
                     for slot, wt in worker_tasks.items():
@@ -1600,6 +1606,8 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                             except Exception as exc:
                                 event(state, f"worker-{slot} raised: {exc}")
                             w = state.workers[slot]
+                            if w.task and w.task.id != "merge":
+                                assigned_ids.discard(w.task.id)
 
                             if w.conflict_ref:
                                 # Conflict worker finished — retry merge
@@ -1831,6 +1839,8 @@ async def async_main() -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     _log_file = log_dir / "swarm.log"
 
+    env_size = sum(len(k) + len(v) + 2 for k, v in _CLAUDE_ENV.items())
+    log(f"env: {len(_CLAUDE_ENV)} vars, {env_size} bytes")
     log("Verifying tools...")
     await verify_tools(local=args.local)
     log("Ensuring beads...")
