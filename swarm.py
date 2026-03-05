@@ -206,7 +206,7 @@ async def stream_output(
 # ── bd helpers ───────────────────────────────────────────────────────────────
 
 async def bd(*args: str, cwd: Path | None = None, check: bool = True) -> str:
-    """Run a bd command and return stdout."""
+    """Run a bd command and return stdout (or stderr on failure with check=False)."""
     proc = await asyncio.create_subprocess_exec(
         "bd", *args,
         stdout=asyncio.subprocess.PIPE,
@@ -218,7 +218,11 @@ async def bd(*args: str, cwd: Path | None = None, check: bool = True) -> str:
         raise RuntimeError(
             f"bd {' '.join(args)} failed (rc={proc.returncode}): {stderr.decode().strip()}"
         )
-    return stdout.decode().strip()
+    # Return stderr when stdout is empty and command failed (for check=False callers)
+    out = stdout.decode().strip()
+    if not out and proc.returncode != 0:
+        out = stderr.decode().strip()
+    return out
 
 
 async def bd_json(*args: str, cwd: Path | None = None) -> list | dict:
@@ -548,12 +552,13 @@ For each branch above:
    - The change is focused and matches a single task
    - No unrelated changes snuck in
 
-3. Run the test suite to verify nothing is broken:
+3. Merge the branch cleanly (no merge commits):
+   git rebase {base_branch} <branch>
    git checkout {base_branch}
-   git merge <branch> --no-edit
+   git merge --ff-only <branch>
    Then run the project's test suite (check package.json / Makefile / pyproject.toml).
 
-4. If the merge + tests pass, you're done with this branch. Move to the next.
+4. If the rebase + tests pass, you're done with this branch. Move to the next.
 
 5. If the branch has issues:
    - Undo the merge: git reset --hard HEAD~1
@@ -1080,11 +1085,23 @@ async def verify_tools(*, local: bool = False) -> None:
 
 async def ensure_beads(repo: Path) -> None:
     """Check that beads is working, initialize if needed."""
-    # Try a quick read command to see if bd is already set up
-    result = await bd("status", cwd=repo, check=False)
-    if "no beads database" in result.lower() or "not found" in result.lower():
+    beads_dir = repo / ".beads"
+    if not beads_dir.exists():
         log("Initializing beads database...")
         await bd("init", cwd=repo)
+        # Disable auto-backup to avoid noisy dolt commits
+        config_path = repo / ".beads" / "config.yaml"
+        if config_path.exists():
+            text = config_path.read_text()
+            if "backup:" not in text:
+                text += "\nbackup:\n  enabled: false\n"
+            else:
+                text = re.sub(
+                    r"(backup:\s*\n\s*enabled:\s*)true",
+                    r"\1false",
+                    text,
+                )
+            config_path.write_text(text)
 
 
 async def create_epic(goal: str, repo: Path) -> str:
@@ -1104,23 +1121,52 @@ async def create_epic(goal: str, repo: Path) -> str:
 def parse_design_deps(doc_path: Path) -> dict[int, list[int]]:
     """Parse dependency edges from a design doc.
 
-    Looks for lines like:
-      **PR 6 — Strategy evaluator loop** (depends on: PR 2, 3, 4)
-    Returns {6: [2, 3, 4], ...}
+    Supports two formats:
+      1. Inline:  **PR 6 — Strategy evaluator loop** (depends on: PR 2, 3, 4)
+      2. Multi-line (bold list item):
+           **T14 — Track A read-only sidecar training**
+           - **Depends on:** T5, T7, T12, T13
+
+    Returns {6: [2, 3, 4], ...} or {14: [5, 7, 12, 13], ...}
     """
     text = doc_path.read_text()
     deps: dict[int, list[int]] = {}
+
+    # Format 1: inline (depends on: ...) in the header line
     for m in re.finditer(
-        r"\*\*PR\s+(\d+)\b.*?\(depends on:\s*(.+?)\)",
+        r"\*\*(?:PR|T)\s*(\d+)\b.*?\(depends on:\s*(.+?)\)",
         text,
     ):
-        pr_num = int(m.group(1))
+        task_num = int(m.group(1))
         dep_str = m.group(2)
-        blockers: list[int] = []
-        for d in re.findall(r"(?:PR\s*)?(\d+)", dep_str):
-            blockers.append(int(d))
+        blockers = [int(d) for d in re.findall(r"(?:PR|T)\s*(\d+)", dep_str)]
+        if not blockers:
+            blockers = [int(d) for d in re.findall(r"(\d+)", dep_str)]
         if blockers:
-            deps[pr_num] = blockers
+            deps[task_num] = blockers
+
+    # Format 2: **T<N> — title** followed by - **Depends on:** line
+    current_task: int | None = None
+    for line in text.splitlines():
+        # Match task header: **T14 — ...** or **PR 3 — ...**
+        hdr = re.match(r"\*\*(?:PR|T)\s*(\d+)\b", line)
+        if hdr:
+            current_task = int(hdr.group(1))
+            continue
+        # Match depends-on list item
+        dep_match = re.match(r"-\s*\*\*Depends on:\*\*\s*(.+)", line, re.IGNORECASE)
+        if dep_match and current_task is not None:
+            dep_str = dep_match.group(1).strip()
+            if dep_str.lower() in ("nothing", "none", "—", "-"):
+                current_task = None
+                continue
+            blockers = [int(d) for d in re.findall(r"(?:PR|T)\s*(\d+)", dep_str)]
+            if not blockers:
+                blockers = [int(d) for d in re.findall(r"(\d+)", dep_str)]
+            if blockers and current_task not in deps:
+                deps[current_task] = blockers
+            current_task = None
+
     return deps
 
 
@@ -1139,12 +1185,13 @@ async def apply_design_deps(
     if not deps:
         return 0
 
-    # Build PR number -> bead ID mapping from task titles
+    # Build task number -> bead ID mapping from task titles
+    # Matches "PR 3", "T14", "T1 —", etc. at the start of titles
     children = await get_all_children(epic_id, cwd=cwd)
     pr_to_bead: dict[int, str] = {}
     for c in children:
         title = c.get("title", "")
-        m = re.match(r"PR\s+(\d+)\b", title)
+        m = re.match(r"(?:PR|T)\s*(\d+)\b", title)
         if m:
             pr_to_bead[int(m.group(1))] = c.get("id", "")
 
@@ -1254,14 +1301,20 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
             cid = c.get("id", "")
             try:
                 dep_data = await bd_json("dep", "list", cid, cwd=state.repo)
-                if isinstance(dep_data, dict):
+                # bd dep list returns a list of related issues with dependency_type
+                blockers_list = []
+                if isinstance(dep_data, list):
+                    for item in dep_data:
+                        if isinstance(item, dict) and item.get("dependency_type") == "blocks":
+                            blockers_list.append(item.get("id", ""))
+                elif isinstance(dep_data, dict):
                     blocked_by = dep_data.get("blocked_by", dep_data.get("blockedBy", []))
-                    if blocked_by:
-                        blockers = ", ".join(
-                            b.get("id", str(b)) if isinstance(b, dict) else str(b)
-                            for b in blocked_by
-                        )
-                        sys.stderr.write(f"  {cid}  blocked by: {blockers}\n")
+                    blockers_list = [
+                        b.get("id", str(b)) if isinstance(b, dict) else str(b)
+                        for b in blocked_by
+                    ]
+                if blockers_list:
+                    sys.stderr.write(f"  {cid}  blocked by: {', '.join(blockers_list)}\n")
             except Exception:
                 pass
         sys.stderr.write(f"\n  {C.DIM}epic: {state.epic_id}{C.RESET}\n")
@@ -1409,6 +1462,12 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                         if goal_complete:
                             event(state, "planner says goal is complete")
                             state.shutdown = True
+                        # Re-apply design doc deps to cover newly created tasks
+                        elif args.design_doc:
+                            n = await apply_design_deps(
+                                state.epic_id, args.design_doc, cwd=state.repo)
+                            if n > 0:
+                                event(state, f"applied {n} dependency edges from {args.design_doc.name}")
                     except Exception as exc:
                         event(state, f"planner failed: {exc}")
                         event(state, "planner cooldown 30s before retry")
@@ -1431,25 +1490,39 @@ async def main_loop(state: SwarmState, args: argparse.Namespace) -> None:
                             w = state.workers[slot]
                             if w.result == "success":
                                 if args.local and w.branch:
-                                    # Local mode: git merge branch
-                                    merge_proc = await asyncio.create_subprocess_exec(
-                                        "git", "merge", w.branch, "--no-edit",
+                                    # Local mode: rebase onto base then fast-forward
+                                    rebase_proc = await asyncio.create_subprocess_exec(
+                                        "git", "rebase", args.base_branch, w.branch,
                                         cwd=state.repo,
                                         stdout=asyncio.subprocess.PIPE,
                                         stderr=asyncio.subprocess.PIPE,
                                     )
-                                    m_out, m_err = await merge_proc.communicate()
-                                    if merge_proc.returncode == 0:
-                                        event(state, f"merged {w.branch} into {args.base_branch}")
-                                    else:
-                                        # Abort the failed merge, queue for merger agent
+                                    await rebase_proc.communicate()
+                                    if rebase_proc.returncode != 0:
                                         await asyncio.create_subprocess_exec(
-                                            "git", "merge", "--abort",
+                                            "git", "rebase", "--abort",
                                             cwd=state.repo,
                                             stdout=asyncio.subprocess.DEVNULL,
                                             stderr=asyncio.subprocess.DEVNULL,
                                         )
-                                        event(state, f"merge conflict on {w.branch} — queuing for merger agent")
+                                    # Switch back to base branch and fast-forward
+                                    await asyncio.create_subprocess_exec(
+                                        "git", "checkout", args.base_branch,
+                                        cwd=state.repo,
+                                        stdout=asyncio.subprocess.DEVNULL,
+                                        stderr=asyncio.subprocess.DEVNULL,
+                                    )
+                                    ff_proc = await asyncio.create_subprocess_exec(
+                                        "git", "merge", "--ff-only", w.branch,
+                                        cwd=state.repo,
+                                        stdout=asyncio.subprocess.PIPE,
+                                        stderr=asyncio.subprocess.PIPE,
+                                    )
+                                    m_out, m_err = await ff_proc.communicate()
+                                    if ff_proc.returncode == 0:
+                                        event(state, f"merged {w.branch} into {args.base_branch}")
+                                    else:
+                                        event(state, f"ff-merge failed on {w.branch} — queuing for merger agent")
                                         if not state.merger_running and (merger_task is None or merger_task.done()):
                                             async def _run_merger(refs=[w.branch]):
                                                 return await run_merger(
@@ -1678,7 +1751,9 @@ async def async_main() -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     _log_file = log_dir / "swarm.log"
 
+    log("Verifying tools...")
     await verify_tools(local=args.local)
+    log("Ensuring beads...")
     await ensure_beads(repo)
 
     log(f'Starting swarm: "{args.task}"')
@@ -1698,6 +1773,7 @@ async def async_main() -> None:
         epic_id = args.epic
         log(f"Resuming epic: {epic_id}")
     else:
+        log("Creating epic...")
         epic_id = await create_epic(args.task, repo)
         log(f"Created epic: {epic_id}")
 
